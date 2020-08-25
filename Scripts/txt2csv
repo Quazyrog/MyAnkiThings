@@ -1,0 +1,194 @@
+#!/bin/python3
+import sys
+import re
+import csv
+import traceback
+
+GLOBAL_COMMANDS = {}
+def gcmd(cmd):
+    def decor(fun):
+        GLOBAL_COMMANDS[cmd] = fun
+        return fun
+    return decor
+
+def gcmd_parse(line):
+    def split(s):
+        res = []
+        w = ""
+        esc = False
+        quot = False
+        for c in s:
+            if esc:
+                w += c
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == "\"":
+                quot = not quot
+            elif c.isspace() and not quot:
+                if w:
+                    res.append(w)
+                w = ""
+            else:
+                w += c
+        if w:
+            res.append(w)
+        return res
+
+    cmd, args = line.split(" ", 1) if line.find(" ") != -1 else (line.strip(), "")
+    args = split(args)
+    return (cmd, args)
+
+@gcmd("COLON_IS_NEWLINE")
+def cmd_colon_is_newline(processor):
+    newline = re.compile(r"\s*;\s+")
+    def transform(line):
+        return newline.sub("\n", line)
+    processor.append_hook("pre-split", "colon-is-newline", transform)
+
+@gcmd("NS")
+def cmd_ns(processor, namespace):
+    def transform(row):
+        row["namespace"] = "[%s]" % namespace
+        return row
+    processor.append_hook("post-split", "namespace", transform)
+
+@gcmd("CLASS")
+def cmd_class(processor, *class_list):
+    def transform(row):
+        if "class" not in row:
+            row["class"] = ""
+        for c in class_list:
+            if row["class"]:
+                row["class"] += " "
+            row["class"] += "#" + c
+        return row
+    processor.append_or_replace_hook("post-split", "class", transform)
+
+@gcmd("TAG")
+def cmd_tag(processor, *tag_list):
+    def transform(row):
+        if "tags" not in row:
+            row["tags"] = ""
+        for c in tag_list:
+            if row["tags"]:
+                row["tags"] += " "
+            row["tags"] += c
+        return row
+    processor.append_or_replace_hook("post-split", "tags", transform)
+
+HASHTAG_RE = re.compile(r"\s+#\S+")
+class FileProcessor:
+    def __init__(self, inf):
+        self._input = open(inf)
+        self._active_hooks_names = []
+        self._hooks = {"pre-split": [], "post-split": []}
+        self.spliter = None
+        self._columns = []
+        self._data = []
+        self._lineno = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, _, __, ___):
+        self._input.close()
+
+    def save(self, outf=None):
+        output = open(outf or (self._input.name + ".csv"), "w")
+        print(self._loc() + "Saving columns: ", ", ".join(self._columns))
+        writer = csv.DictWriter(output, self._columns)
+        writer.writerows(self._data)
+        output.close()
+        print(self._loc() + "Saved %i rows to %s" % (len(self._data), output.name))
+
+    def process(self):
+        for line in open(sys.argv[1]):
+            self._lineno += 1
+            if line.startswith("!!"):
+                cmd, args = gcmd_parse(line[2:])
+                if cmd not in GLOBAL_COMMANDS:
+                    raise IndexError(self._loc() + "no global command '%s'" % cmd)
+                GLOBAL_COMMANDS[cmd](self, *args)
+            else:
+                line = line[:-1].strip()
+                if not line:
+                    continue
+                line = self.apply_hooks("pre-split", line)
+                line = self.split(line)
+                line = self.apply_hooks("post-split", line)
+                for col in line:
+                    if col not in self._columns:
+                        self._columns.append(col)
+                self._data.append(line)
+
+    def apply_hooks(self, stage, line):
+        for (name, hook) in self._hooks[stage]:
+            line = hook(line)
+        return line
+
+    def split(self, line):
+        if self.spliter:
+            return (self.spliter)(line)
+        htags = []
+        for htag in HASHTAG_RE.findall(line):
+            htags.append(htag.strip())
+        htags.sort()
+        line = HASHTAG_RE.sub(" ", line)
+        fields = line.split("=", 1)
+        return {"word": fields[0].strip(), "meaning": fields[1].strip(), "class": " ".join(htags)}
+
+    def _add_hook(self, stage, name, hook_function, prepend, replace):
+        if stage not in self._hooks:
+            raise ValueError(self._loc() + "no hook stage '%s'" % stage)
+        hook_list = self._hooks[stage]
+        if name in self._active_hooks_names:
+            if replace:
+                for i in range(len(hook_list)):
+                    if hook_list[i][0] == name:
+                        hook_list[i] = (name, hook_function)
+                        print(self._loc() + "Updated hook %s" % name)
+                        return
+                assert False
+            else:
+                raise ValueError(self._loc() + "hook named '%s' already active" % name)
+        idx = 0 if prepend else len(self._hooks[stage])
+        self._hooks[stage].insert(idx, (name, hook_function))
+        self._active_hooks_names.append(name)
+        print(self._loc() + "Applying hook %s" % name)
+
+    def prepend_hook(self, stage, name, hook):
+        self._add_hook(stage, name, hook, True, False)
+
+    def append_hook(self, stage, name, hook):
+        self._add_hook(stage, name, hook, False, False)
+
+    def prepend_or_replace_hook(self, stage, name, hook):
+        self._add_hook(stage, name, hook, True, True)
+
+    def append_or_replace_hook(self, stage, name, hook):
+        self._add_hook(stage, name, hook, False, True)
+
+    def remove_hook(self, name):
+        for stage_hooks in self._hooks.values():
+            for i in range(len(stage_hooks)):
+                if name == stage_hooks[i][0]:
+                    del stage_hooks[i]
+                    return
+        raise ValueError(self._loc() + "no hook named '%s'" % name)
+
+    @property
+    def location(self):
+        return (self._input.name, self._lineno)
+
+    def _loc(self):
+        return "%s:%i:  " % (self._input.name, self._lineno)
+
+
+with FileProcessor(sys.argv[1]) as fp:
+    try:
+        fp.process()
+        fp.save(sys.argv[2] if len(sys.argv) > 2 else None)
+    except Exception as e:
+        print(("%s:%i:  " % fp.location) + str(e))
+        traceback.print_exc()
